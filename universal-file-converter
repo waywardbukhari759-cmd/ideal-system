@@ -1,0 +1,180 @@
+import os
+import shutil
+import subprocess
+import uuid
+import zipfile
+import time
+from pathlib import Path
+from flask import Flask, request, send_file, render_template, jsonify, abort
+from werkzeug.utils import secure_filename
+from PIL import Image
+
+# Optional libs
+try:
+    from pdf2docx import Converter as PDF2DocxConverter
+    HAS_PDF2DOCX = True
+except Exception:
+    HAS_PDF2DOCX = False
+
+try:
+    from pdf2image import convert_from_path
+    HAS_PDF2IMAGE = True
+except Exception:
+    HAS_PDF2IMAGE = False
+
+# Optional: python-magic for file type sniffing
+try:
+    import magic
+    HAS_MAGIC = True
+except Exception:
+    HAS_MAGIC = False
+
+# Config
+BASE_DIR = Path(__file__).parent
+UPLOAD_DIR = BASE_DIR / "tmp_uploads"
+OUTPUT_DIR = BASE_DIR / "tmp_outputs"
+ALLOWED_EXT = {
+    "docx","doc","pdf","jpg","jpeg","png","tiff","txt","rtf","odt"
+}
+MAX_CONTENT_LENGTH = 200 * 1024 * 1024  # 200MB per request
+
+# Ensure dirs
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# Helper: allowed file extension
+def ext_from_filename(fn: str):
+    return fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+
+def allowed_filename(filename):
+    ext = ext_from_filename(filename)
+    return ext in ALLOWED_EXT
+
+def run_libreoffice_convert(input_path: Path, out_dir: Path, to_ext: str):
+    """
+    Use LibreOffice headless to convert office files.
+    """
+    cmd = [
+        "libreoffice",
+        "--headless",
+        "--convert-to", to_ext,
+        "--outdir", str(out_dir),
+        str(input_path)
+    ]
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def sniff_mime(path: Path):
+    if not HAS_MAGIC:
+        return None
+    try:
+        m = magic.Magic(mime=True)
+        return m.from_file(str(path))
+    except Exception:
+        return None
+
+def make_zip(files: list[Path], out_zip: Path):
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            z.write(p, arcname=p.name)
+    return out_zip
+
+def cleanup_old(temp_root: Path, older_than_seconds: int = 3600):
+    """
+    Remove subdirectories older than threshold to keep disk usage manageable.
+    Called occasionally (non-blocking).
+    """
+    now = time.time()
+    for child in temp_root.iterdir():
+        try:
+            mtime = child.stat().st_mtime
+            if now - mtime > older_than_seconds:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/convert", methods=["POST"])
+def convert():
+    """
+    Accepts:
+      - files[] : one or multiple files
+      - target : target extension (e.g. 'pdf','docx','jpg','png')
+    Returns:
+      - single file (attachment) or zip when multiple outputs.
+    """
+    # Simple housekeeping (not blocking heavy)
+    try:
+        cleanup_old(UPLOAD_DIR, older_than_seconds=2*3600)  # 2 hours
+        cleanup_old(OUTPUT_DIR, older_than_seconds=2*3600)
+    except Exception:
+        pass
+
+    if 'files[]' not in request.files and 'file' not in request.files:
+        return jsonify({"error":"No file part in request"}), 400
+
+    files = request.files.getlist('files[]') or [request.files.get('file')]
+    target = request.form.get('target', '').lower().strip()
+    if not target:
+        return jsonify({"error":"No target format specified"}), 400
+
+    uid = uuid.uuid4().hex
+    in_dir = UPLOAD_DIR / uid
+    out_dir = OUTPUT_DIR / uid
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_inputs = []
+    for f in files:
+        if not f or f.filename == "":
+            continue
+        filename = secure_filename(f.filename)
+        if not allowed_filename(filename):
+            return jsonify({"error": f"File type not allowed: {filename}"}), 400
+        path = in_dir / filename
+        f.save(str(path))
+        saved_inputs.append(path)
+
+    if not saved_inputs:
+        return jsonify({"error":"No valid files uploaded"}), 400
+
+    produced_files = []
+    try:
+        for in_path in saved_inputs:
+            src_ext = ext_from_filename(in_path.name)
+            target_ext = target
+
+            # 1) Office docs -> PDF
+            if src_ext in ('doc','docx','odt','rtf','txt') and target_ext == 'pdf':
+                run_libreoffice_convert(in_path, out_dir, 'pdf')
+                candidates = list(out_dir.glob(f"{in_path.stem}*.pdf"))
+                produced_files.extend(candidates)
+
+            # 2) doc/pdf bidirectional (PDF->docx)
+            elif src_ext == 'pdf' and target_ext in ('docx','doc'):
+                if HAS_PDF2DOCX and target_ext == 'docx':
+                    out_file = out_dir / (in_path.stem + ".docx")
+                    cv = PDF2DocxConverter(str(in_path))
+                    cv.convert(str(out_file))
+                    cv.close()
+                    produced_files.append(out_file)
+                else:
+                    # fallback to libreoffice (best-effort)
+                    run_libreoffice_convert(in_path, out_dir, target_ext)
+                    produced_files.extend(list(out_dir.glob(f"{in_path.stem}*.{target_ext}")))
+
+            # 3) Images -> PDF
+            elif src_ext in ('jpg','jpeg','png','tiff') and target_ext == 'pdf':
+                out_file = out_dir / (in_path.stem + ".pdf")
+                img = Image.open(in_path)
+                if img.mode in ("RGBA","LA"):
+                    bg = Image.new("RGB", img.size, (255,255,255))
+                    bg.paste(img, mask=img.split()[-
